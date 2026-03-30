@@ -23,6 +23,7 @@ def main():
     model = YOLO("yolo26s.pt")  # genauer als nano
 
     face_detector = None
+    face_cascade = None
     try:
         yunet_path = ensure_yunet_model()
         face_detector = cv2.FaceDetectorYN.create(
@@ -36,10 +37,9 @@ def main():
         print("YuNet Gesichtserkennung aktiv.")
     except Exception as e:
         print(f"YuNet nicht verfuegbar ({e}), nutze Haar-Cascade Fallback.")
-
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():

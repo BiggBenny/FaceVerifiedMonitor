@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/python persondetect.py)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(xargs grep:*)",
+      "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 venv/Scripts/python embed.py)",
+      "Bash(venv/Scripts/pip show:*)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/python -c \"import onnxruntime; print\\(onnxruntime.__version__\\)\")"
+    ]
+  }
+}
