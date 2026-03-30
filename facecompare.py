@@ -1,6 +1,6 @@
 """
 Gesichtsvergleich mit ArcFace-Embeddings.
-- Gesichtsdetektion: YuNet (OpenCV)
+- Gesichtsdetektion: SCRFD det_10g (insightface, ONNX via onnxruntime)
 - Embeddings:        ArcFace w600k_r50 (ONNX via onnxruntime)
 - Vergleich:         Eigene Kosinus-Ähnlichkeit (kein Framework-Vergleich)
 - GUI:               Tkinter
@@ -19,53 +19,76 @@ from PIL import Image, ImageTk
 
 
 # ---------------------------------------------------------------------------
-# Modell-Download-Pfade
+# Modell-Pfade
 # ---------------------------------------------------------------------------
 
-MODEL_DIR = Path(__file__).parent / "models"
-YUNET_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
+MODEL_DIR    = Path(__file__).parent / "models"
+SCRFD_PATH   = MODEL_DIR / "det_10g.onnx"
 ARCFACE_PATH = MODEL_DIR / "w600k_r50.onnx"
 
-YUNET_URL = (
-    "https://github.com/opencv/opencv_zoo/raw/main/models/"
-    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
-)
-# buffalo_l-Zip enthält w600k_r50.onnx (ArcFace ResNet50)
 BUFFALO_L_URL = (
     "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
 )
 
 
 # ---------------------------------------------------------------------------
-# Eigene Vergleichsfunktionen (keine Framework-Methode verwendet)
+# Download: beide Modelle aus buffalo_l.zip
+# ---------------------------------------------------------------------------
+
+def ensure_models(progress_cb=None):
+    MODEL_DIR.mkdir(exist_ok=True)
+
+    if SCRFD_PATH.exists() and ARCFACE_PATH.exists():
+        return
+
+    zip_path = MODEL_DIR / "buffalo_l.zip"
+
+    if not zip_path.exists():
+        if progress_cb:
+            progress_cb("Lade buffalo_l.zip herunter (~330 MB)…")
+        urlretrieve(BUFFALO_L_URL, zip_path)
+
+    if progress_cb:
+        progress_cb("Entpacke Modelle…")
+
+    need = {
+        "det_10g.onnx":   SCRFD_PATH,
+        "w600k_r50.onnx": ARCFACE_PATH,
+    }
+    with zipfile.ZipFile(zip_path) as z:
+        for entry in z.namelist():
+            filename = Path(entry).name
+            if filename in need and not need[filename].exists():
+                need[filename].write_bytes(z.read(entry))
+
+    zip_path.unlink(missing_ok=True)
+
+    missing = [k for k, v in need.items() if not v.exists()]
+    if missing:
+        raise FileNotFoundError(f"Nicht in buffalo_l.zip gefunden: {missing}")
+
+
+# ---------------------------------------------------------------------------
+# Eigene Vergleichsfunktionen (kein Framework-Vergleich)
 # ---------------------------------------------------------------------------
 
 def cosine_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
-    """
-    Kosinus-Ähnlichkeit zweier Vektoren.
-    cos(θ) = (a · b) / (||a|| · ||b||)
-    Rückgabe: Wert in [-1, 1], je höher desto ähnlicher.
-    """
-    dot = float(np.dot(emb1, emb2))
+    """cos(θ) = (a · b) / (‖a‖ · ‖b‖)  →  [-1, 1]"""
+    dot   = float(np.dot(emb1, emb2))
     denom = float(np.linalg.norm(emb1) * np.linalg.norm(emb2))
     return dot / denom if denom > 0 else 0.0
 
 
 def euclidean_distance(emb1: np.ndarray, emb2: np.ndarray) -> float:
-    """Euklidischer Abstand (kleiner = ähnlicher)."""
-    return float(np.sqrt(np.sum((emb1 - emb2) ** 2)))
+    return float(np.linalg.norm(emb1 - emb2))
 
 
 def similarity_to_percent(cos_sim: float) -> float:
-    """Kosinus-Ähnlichkeit [-1, 1] → Prozentwert [0, 100]."""
     return (cos_sim + 1.0) / 2.0 * 100.0
 
 
 def interpret(cos_sim: float) -> tuple[str, str]:
-    """
-    Schwellwert basiert auf ArcFace LFW-Benchmark (EER ≈ 0.28).
-    Gibt (Text, Farbe) zurück.
-    """
+    """Schwellwerte auf Basis des ArcFace-LFW-Benchmarks (EER ≈ 0.28)."""
     if cos_sim >= 0.50:
         return "Sehr wahrscheinlich dieselbe Person", "#2ecc71"
     if cos_sim >= 0.30:
@@ -76,52 +99,162 @@ def interpret(cos_sim: float) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Modell-Verwaltung
+# SCRFD-Detektor (det_10g.onnx)
+# Strides [8, 16, 32], 2 Anchors/Location, 5 Landmarks
+# Ausgabe-Reihenfolge (insightface-Standard):
+#   [0-2] Score  je Stride  (1, N, 1)
+#   [3-5] BBox   je Stride  (1, N, 4)
+#   [6-8] Kps    je Stride  (1, N, 10)
 # ---------------------------------------------------------------------------
 
-def ensure_yunet() -> str:
-    MODEL_DIR.mkdir(exist_ok=True)
-    if not YUNET_PATH.exists():
-        print("Lade YuNet herunter…")
-        urlretrieve(YUNET_URL, YUNET_PATH)
-    return str(YUNET_PATH)
+class SCRFDDetector:
+    _STRIDES      = [8, 16, 32]
+    _NUM_ANCHORS  = 2
+    _INPUT_SIZE   = 640
 
+    def __init__(self, model_path: str):
+        self._sess = ort.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"]
+        )
+        self._input_name  = self._sess.get_inputs()[0].name
+        self._output_names = [o.name for o in self._sess.get_outputs()]
 
-def ensure_arcface(progress_cb=None) -> str:
-    MODEL_DIR.mkdir(exist_ok=True)
-    if ARCFACE_PATH.exists():
-        return str(ARCFACE_PATH)
+    # ---- Vorverarbeitung ------------------------------------------------
 
-    if progress_cb:
-        progress_cb("ArcFace-Modell wird heruntergeladen (~330 MB)…")
+    def _letterbox(self, img: np.ndarray):
+        """Skaliert proportional auf INPUT_SIZE×INPUT_SIZE (oben-links ausgerichtet)."""
+        h, w = img.shape[:2]
+        scale = self._INPUT_SIZE / max(h, w)
+        nh, nw = int(h * scale), int(w * scale)
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        canvas = np.zeros((self._INPUT_SIZE, self._INPUT_SIZE, 3), dtype=np.float32)
+        canvas[:nh, :nw] = resized.astype(np.float32)
+        return canvas, scale
 
-    print("Lade buffalo_l.zip herunter…")
-    zip_path = MODEL_DIR / "buffalo_l.zip"
-    urlretrieve(BUFFALO_L_URL, zip_path)
+    def _preprocess(self, img_bgr: np.ndarray):
+        canvas, scale = self._letterbox(img_bgr)
+        # BGR → RGB, [-1, 1], NCHW
+        blob = (canvas[:, :, ::-1] - 127.5) / 128.0
+        blob = blob.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+        return blob, scale
 
-    print("Entpacke w600k_r50.onnx…")
-    with zipfile.ZipFile(zip_path) as z:
-        for name in z.namelist():
-            if name.endswith("w600k_r50.onnx"):
-                data = z.read(name)
-                ARCFACE_PATH.write_bytes(data)
-                break
-    zip_path.unlink(missing_ok=True)
+    # ---- Anchor-Erzeugung -----------------------------------------------
 
-    if not ARCFACE_PATH.exists():
-        raise FileNotFoundError("w600k_r50.onnx nicht in buffalo_l.zip gefunden.")
-    return str(ARCFACE_PATH)
+    @staticmethod
+    def _anchor_centers(stride: int, num_anchors: int) -> np.ndarray:
+        """Gitter-Ankerpunkte für einen Stride (kein Offset)."""
+        size  = SCRFDDetector._INPUT_SIZE // stride
+        grid  = np.stack(np.mgrid[:size, :size][::-1], axis=-1).astype(np.float32)
+        centers = (grid * stride).reshape(-1, 2)          # (size², 2)
+        return np.tile(centers, (1, num_anchors)).reshape(-1, 2)  # interleaved
+
+    # ---- Dekodierung ----------------------------------------------------
+
+    @staticmethod
+    def _decode_bbox(centers: np.ndarray, deltas: np.ndarray) -> np.ndarray:
+        """
+        BBox-Dekodierung: Ankerpunkt ± Abstandswert → [x1, y1, x2, y2].
+        """
+        x1 = centers[:, 0] - deltas[:, 0]
+        y1 = centers[:, 1] - deltas[:, 1]
+        x2 = centers[:, 0] + deltas[:, 2]
+        y2 = centers[:, 1] + deltas[:, 3]
+        return np.stack([x1, y1, x2, y2], axis=1)
+
+    @staticmethod
+    def _decode_kps(centers: np.ndarray, deltas: np.ndarray) -> np.ndarray:
+        """
+        Landmark-Dekodierung: 5 Punkte (x, y) relativ zum Ankerpunkt.
+        """
+        pts = []
+        for i in range(0, 10, 2):
+            pts.append(centers[:, 0] + deltas[:, i])
+            pts.append(centers[:, 1] + deltas[:, i + 1])
+        return np.stack(pts, axis=1).reshape(-1, 5, 2)
+
+    # ---- NMS ------------------------------------------------------------
+
+    @staticmethod
+    def _nms(bboxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> np.ndarray:
+        """IoU-basiertes Greedy-NMS, gibt beibehaltene Indizes zurück."""
+        x1, y1, x2, y2 = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+        order = scores.argsort()[::-1]
+        keep  = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            ix1 = np.maximum(x1[i], x1[order[1:]])
+            iy1 = np.maximum(y1[i], y1[order[1:]])
+            ix2 = np.minimum(x2[i], x2[order[1:]])
+            iy2 = np.minimum(y2[i], y2[order[1:]])
+            inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
+            iou   = inter / (areas[i] + areas[order[1:]] - inter + 1e-7)
+            order = order[1:][iou <= iou_thresh]
+        return np.array(keep, dtype=np.int64)
+
+    # ---- Haupt-Interface ------------------------------------------------
+
+    def detect(
+        self,
+        img_bgr: np.ndarray,
+        score_thresh: float = 0.5,
+        nms_thresh:   float = 0.4,
+    ) -> list[dict]:
+        """
+        Gibt eine Liste von Dicts zurück:
+          {'bbox': [x1,y1,x2,y2], 'score': float, 'kps': np.ndarray(5,2)}
+        Koordinaten sind auf das Original-Bild skaliert.
+        """
+        blob, scale = self._preprocess(img_bgr)
+        outs = self._sess.run(self._output_names, {self._input_name: blob})
+
+        fmc = len(self._STRIDES)          # 3
+        all_scores, all_bboxes, all_kps = [], [], []
+
+        for i, stride in enumerate(self._STRIDES):
+            scores  = outs[i].reshape(-1)           # (N,)
+            bdeltas = outs[i + fmc].reshape(-1, 4) * stride
+            kdeltas = outs[i + fmc * 2].reshape(-1, 10) * stride
+
+            centers = self._anchor_centers(stride, self._NUM_ANCHORS)
+
+            mask    = scores >= score_thresh
+            if not mask.any():
+                continue
+
+            all_scores.append(scores[mask])
+            all_bboxes.append(self._decode_bbox(centers[mask], bdeltas[mask]))
+            all_kps.append(self._decode_kps(centers[mask], kdeltas[mask]))
+
+        if not all_scores:
+            return []
+
+        scores  = np.concatenate(all_scores)
+        bboxes  = np.concatenate(all_bboxes)
+        kps_all = np.concatenate(all_kps)
+
+        keep = self._nms(bboxes, scores, nms_thresh)
+
+        # Skalierung zurück auf Original-Bild
+        inv = 1.0 / scale
+        results = []
+        for k in keep:
+            results.append({
+                "bbox":  (bboxes[k] * inv).tolist(),
+                "score": float(scores[k]),
+                "kps":   kps_all[k] * inv,
+            })
+        return results
 
 
 # ---------------------------------------------------------------------------
-# ArcFace-Inferenz via ONNX (ohne insightface-Vergleichsmethode)
+# ArcFace-Inferenz (w600k_r50.onnx)
 # ---------------------------------------------------------------------------
 
 class ArcFaceONNX:
-    """Minimaler Wrapper um das ArcFace ONNX-Modell."""
-
-    # Referenz-Landmarks für die Gesichts-Ausrichtung (112×112)
-    _REFERENCE_LANDMARKS = np.array([
+    # Standard-Referenz-Landmarks für 112×112 (insightface arcface_dst)
+    _REF_KPS = np.array([
         [38.2946, 51.6963],
         [73.5318, 51.5014],
         [56.0252, 71.7366],
@@ -130,65 +263,49 @@ class ArcFaceONNX:
     ], dtype=np.float32)
 
     def __init__(self, model_path: str):
-        self._session = ort.InferenceSession(
-            model_path,
-            providers=["CPUExecutionProvider"],
+        self._sess = ort.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"]
         )
-        self._input_name = self._session.get_inputs()[0].name
+        self._input_name = self._sess.get_inputs()[0].name
 
-    def _align_face(self, img_bgr: np.ndarray, landmarks5: np.ndarray) -> np.ndarray:
-        """Affine Transformation anhand der 5 Landmark-Punkte auf 112×112."""
-        src = landmarks5.astype(np.float32)
-        dst = self._REFERENCE_LANDMARKS
-        transform = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)[0]
-        aligned = cv2.warpAffine(img_bgr, transform, (112, 112))
-        return aligned
+    def _align(self, img_bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
+        """Affine Ausrichtung auf 112×112 anhand der 5 Landmarks."""
+        M, _ = cv2.estimateAffinePartial2D(
+            kps.astype(np.float32), self._REF_KPS, method=cv2.LMEDS
+        )
+        return cv2.warpAffine(img_bgr, M, (112, 112))
 
-    def _preprocess(self, face_bgr: np.ndarray) -> np.ndarray:
-        """BGR → RGB, normalisiert auf [-1, 1], NCHW-Format."""
-        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-        face_f = (face_rgb.astype(np.float32) - 127.5) / 128.0
-        return face_f.transpose(2, 0, 1)[np.newaxis]  # (1, 3, 112, 112)
-
-    def get_embedding(self, img_bgr: np.ndarray, landmarks5: np.ndarray) -> np.ndarray:
-        """Gibt L2-normierten 512-dim Embedding-Vektor zurück."""
-        aligned = self._align_face(img_bgr, landmarks5)
-        blob = self._preprocess(aligned)
-        output = self._session.run(None, {self._input_name: blob})[0][0]
-        norm = np.linalg.norm(output)
-        return output / norm if norm > 0 else output
+    def get_embedding(self, img_bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
+        """L2-normierter 512-dim ArcFace-Vektor."""
+        face   = self._align(img_bgr, kps)
+        face_f = cv2.cvtColor(face, cv2.COLOR_BGR2RGB).astype(np.float32)
+        blob   = ((face_f - 127.5) / 128.0).transpose(2, 0, 1)[np.newaxis]
+        emb    = self._sess.run(None, {self._input_name: blob})[0][0]
+        norm   = np.linalg.norm(emb)
+        return emb / norm if norm > 0 else emb
 
 
 # ---------------------------------------------------------------------------
-# Gesichtserkennung (YuNet) + Embedding-Extraktion
+# Pipeline: Bild → Embedding
 # ---------------------------------------------------------------------------
 
 def detect_and_embed(
-    yunet: cv2.FaceDetectorYN,
-    arcface: ArcFaceONNX,
+    detector: SCRFDDetector,
+    arcface:  ArcFaceONNX,
     image_path: str,
 ) -> np.ndarray | None:
-    """
-    Erkennt das größte Gesicht im Bild und gibt sein ArcFace-Embedding zurück.
-    Gibt None zurück, wenn kein Gesicht gefunden wurde.
-    """
+    """Größtes Gesicht im Bild → ArcFace-Embedding. None wenn kein Gesicht."""
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Bild konnte nicht geladen werden: {image_path}")
 
-    h, w = img.shape[:2]
-    yunet.setInputSize((w, h))
-    _, faces = yunet.detect(img)
-
-    if faces is None or len(faces) == 0:
+    faces = detector.detect(img, score_thresh=0.5)
+    if not faces:
         return None
 
-    # Größtes Gesicht (höchste Bounding-Box-Fläche)
-    best = max(faces, key=lambda f: f[2] * f[3])
-
-    # Landmarks: Spalten 4–13 → 5 Punkte (x,y)
-    landmarks = best[4:14].reshape(5, 2)
-    return arcface.get_embedding(img, landmarks)
+    best = max(faces, key=lambda f: (f["bbox"][2] - f["bbox"][0]) *
+                                     (f["bbox"][3] - f["bbox"][1]))
+    return arcface.get_embedding(img, best["kps"])
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +313,11 @@ def detect_and_embed(
 # ---------------------------------------------------------------------------
 
 PREVIEW_W, PREVIEW_H = 300, 300
-BG   = "#1e1e2e"
+BG    = "#1e1e2e"
 PANEL = "#2a2a3e"
 ACCENT = "#7c3aed"
-TEXT = "#cdd6f4"
-GRAY = "#585b70"
+TEXT  = "#cdd6f4"
+GRAY  = "#585b70"
 
 
 class FaceCompareApp(tk.Tk):
@@ -210,11 +327,11 @@ class FaceCompareApp(tk.Tk):
         self.resizable(False, False)
         self.configure(bg=BG)
 
-        self.yunet: cv2.FaceDetectorYN | None = None
-        self.arcface: ArcFaceONNX | None = None
-        self.paths = [None, None]
+        self.detector: SCRFDDetector | None = None
+        self.arcface:  ArcFaceONNX  | None = None
+        self.paths      = [None, None]
         self.embeddings = [None, None]
-        self._photos = [None, None]  # tk.PhotoImage-Referenzen
+        self._photos    = [None, None]
 
         self._build_ui()
         self.after(150, self._load_models_threaded)
@@ -234,12 +351,12 @@ class FaceCompareApp(tk.Tk):
             font=("Segoe UI", 10), bg=BG, fg=GRAY,
         ).pack(pady=(0, 14))
 
-        # ---- Bildpanels ----
         row = tk.Frame(self, bg=BG)
         row.pack(padx=20)
 
-        self._canvases: list[tk.Canvas] = []
-        self._status_lbls: list[tk.Label] = []
+        self._canvases:    list[tk.Canvas] = []
+        self._status_lbls: list[tk.Label]  = []
+        self._load_btns:   list[tk.Button] = []
 
         for i in range(2):
             col = tk.Frame(row, bg=PANEL)
@@ -250,17 +367,20 @@ class FaceCompareApp(tk.Tk):
             c.pack(padx=2, pady=2)
             c.create_text(PREVIEW_W // 2, PREVIEW_H // 2,
                           text=f"Bild {i+1}", fill=GRAY,
-                          font=("Segoe UI", 14), tags="placeholder")
+                          font=("Segoe UI", 14))
             self._canvases.append(c)
 
-            tk.Button(
+            btn = tk.Button(
                 col, text=f"  Bild {i+1} laden  ",
                 font=("Segoe UI", 10, "bold"),
                 bg=ACCENT, fg="white",
                 activebackground="#6d28d9", activeforeground="white",
                 relief="flat", cursor="hand2", padx=8, pady=6,
+                state="disabled",
                 command=lambda idx=i: self._load_image(idx),
-            ).pack(pady=(0, 4))
+            )
+            btn.pack(pady=(0, 4))
+            self._load_btns.append(btn)
 
             lbl = tk.Label(col, text="–", font=("Segoe UI", 9),
                            bg=PANEL, fg=GRAY)
@@ -271,7 +391,6 @@ class FaceCompareApp(tk.Tk):
                 tk.Label(row, text="vs.", font=("Segoe UI", 20, "bold"),
                          bg=BG, fg=GRAY).grid(row=0, column=1, padx=6)
 
-        # ---- Vergleiche-Button ----
         self._cmp_btn = tk.Button(
             self, text="  Gesichter vergleichen  ",
             font=("Segoe UI", 12, "bold"),
@@ -283,23 +402,21 @@ class FaceCompareApp(tk.Tk):
         )
         self._cmp_btn.pack(pady=(18, 8))
 
-        # ---- Ergebnis-Box ----
-        res_frame = tk.Frame(self, bg=PANEL)
-        res_frame.pack(padx=20, pady=(0, 16), fill="x")
+        res = tk.Frame(self, bg=PANEL)
+        res.pack(padx=20, pady=(0, 16), fill="x")
 
         self._result_lbl = tk.Label(
-            res_frame, text="", font=("Segoe UI", 13, "bold"),
+            res, text="", font=("Segoe UI", 13, "bold"),
             bg=PANEL, fg=TEXT, pady=8,
         )
         self._result_lbl.pack()
 
         self._detail_lbl = tk.Label(
-            res_frame, text="", font=("Segoe UI", 10),
+            res, text="", font=("Segoe UI", 10),
             bg=PANEL, fg=GRAY, pady=4,
         )
         self._detail_lbl.pack()
 
-        # ---- Footer-Status ----
         self._footer = tk.Label(
             self, text="Modelle werden geladen…",
             font=("Segoe UI", 9), bg=BG, fg=GRAY,
@@ -307,37 +424,35 @@ class FaceCompareApp(tk.Tk):
         self._footer.pack(pady=(0, 10))
 
     # ------------------------------------------------------------------
-    # Modelle laden
+    # Modelle laden (Hintergrund-Thread)
     # ------------------------------------------------------------------
 
     def _load_models_threaded(self):
-        t = threading.Thread(target=self._load_models, daemon=True)
-        t.start()
+        threading.Thread(target=self._load_models, daemon=True).start()
+
+    def _enable_load_buttons(self):
+        for btn in self._load_btns:
+            btn.config(state="normal")
+
+    def _set_footer(self, text, color=GRAY):
+        self._footer.config(text=text, fg=color)
 
     def _load_models(self):
         try:
-            self._footer.config(text="Lade YuNet…")
-            self.update()
-            yunet_path = ensure_yunet()
-            self.yunet = cv2.FaceDetectorYN.create(
-                yunet_path, "", (320, 320),
-                score_threshold=0.7,
-                nms_threshold=0.3,
-                top_k=5000,
-            )
+            self.after(0, self._set_footer, "Lade Modelle… (1x Download ~330 MB)")
+            ensure_models(progress_cb=lambda m: self.after(0, self._set_footer, m))
 
-            self._footer.config(
-                text="Lade ArcFace ONNX-Modell… (1x Download ~330 MB)"
-            )
-            self.update()
-            arcface_path = ensure_arcface(
-                progress_cb=lambda msg: self._footer.config(text=msg)
-            )
-            self.arcface = ArcFaceONNX(arcface_path)
-            self._footer.config(text="Bereit.")
+            self.after(0, self._set_footer, "Initialisiere SCRFD-Detektor…")
+            self.detector = SCRFDDetector(str(SCRFD_PATH))
+
+            self.after(0, self._set_footer, "Initialisiere ArcFace…")
+            self.arcface = ArcFaceONNX(str(ARCFACE_PATH))
+
+            self.after(0, self._set_footer, "Bereit.")
+            self.after(0, self._enable_load_buttons)
         except Exception as e:
-            self._footer.config(text=f"Fehler beim Laden: {e}", fg="#e74c3c")
-            messagebox.showerror("Modellfehler", str(e))
+            self.after(0, self._set_footer, f"Fehler: {e}", "#e74c3c")
+            self.after(0, messagebox.showerror, "Modellfehler", str(e))
 
     # ------------------------------------------------------------------
     # Bild laden
@@ -354,19 +469,19 @@ class FaceCompareApp(tk.Tk):
         if not path:
             return
 
-        self.paths[idx] = path
+        self.paths[idx]      = path
         self.embeddings[idx] = None
         self._status_lbls[idx].config(text="Verarbeite…", fg=GRAY)
         self._show_preview(idx, path)
         self._clear_result()
         self.update()
 
-        if self.arcface is None or self.yunet is None:
+        if self.detector is None or self.arcface is None:
             self._status_lbls[idx].config(text="Modell noch nicht bereit", fg="#e74c3c")
             return
 
         try:
-            emb = detect_and_embed(self.yunet, self.arcface, path)
+            emb = detect_and_embed(self.detector, self.arcface, path)
             if emb is None:
                 self._status_lbls[idx].config(text="Kein Gesicht gefunden", fg="#e74c3c")
             else:
@@ -395,7 +510,7 @@ class FaceCompareApp(tk.Tk):
         self._detail_lbl.config(text="")
 
     # ------------------------------------------------------------------
-    # Vergleich — eigene Implementierung, kein Framework-Vergleich
+    # Vergleich
     # ------------------------------------------------------------------
 
     def _compare(self):
@@ -408,15 +523,12 @@ class FaceCompareApp(tk.Tk):
         pct      = similarity_to_percent(cos_sim)
         verdict, color = interpret(cos_sim)
 
-        self._result_lbl.config(
-            text=f"{verdict}  —  {pct:.1f} %",
-            fg=color,
-        )
+        self._result_lbl.config(text=f"{verdict}  —  {pct:.1f} %", fg=color)
         self._detail_lbl.config(
             text=(
                 f"Kosinus-Ähnlichkeit: {cos_sim:+.4f}   |   "
                 f"Euklidischer Abstand: {euc_dist:.4f}   |   "
-                f"Embedding-Dim: {len(emb1)}"
+                f"Dim: {len(emb1)}"
             ),
         )
 
