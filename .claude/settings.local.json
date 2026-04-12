@@ -8,7 +8,10 @@
       "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 venv/Scripts/python embed.py)",
       "Bash(venv/Scripts/pip show:*)",
       "Bash(venv/Scripts/pip install:*)",
-      "Bash(venv/Scripts/python -c \"import onnxruntime; print\\(onnxruntime.__version__\\)\")"
+      "Bash(venv/Scripts/python -c \"import onnxruntime; print\\(onnxruntime.__version__\\)\")",
+      "Bash(venv/Scripts/python.exe persondetect.py)",
+      "Bash(venv/Scripts/python.exe -c \"import cv2; cap = cv2.VideoCapture\\(0, cv2.CAP_DSHOW\\); print\\(''Kamera offen:'', cap.isOpened\\(\\)\\); cap.release\\(\\)\")",
+      "Bash(ls \"g:/Meine Ablage/Programming/Projects/MA/FaceCheck/\"*.pt)"
     ]
   }
 }
